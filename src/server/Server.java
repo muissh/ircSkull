@@ -10,8 +10,17 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.StringTokenizer;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
 
 /**
  * SERVER CLASS
@@ -28,26 +37,41 @@ public final class Server extends Thread {
     private final ServerSocket serverSocket;
     private final int serverSocketPort = 55495;
     private static int clientPort = 55495;
-
     
+    private static PrivateKey privateKey;
+    private static PublicKey publicKey;
+ 
+    /**
+     * 
+     * @param args 
+     */
     public static void main(String[] args) {
         try {
             Server chatServer = new Server();
             chatServer.start();
-        } catch (IOException ioe) {
+            AssyKeyGen();
+        } catch (Exception ioe) {
             System.err.println("Error while launching server "+ ioe);
         }
     }
 
+    /**
+     * 
+     * @throws IOException 
+     */
     Server() throws IOException { 
         serverSocket = new ServerSocket(serverSocketPort);
-        System.out.println("Server launch on port : " + serverSocket.getLocalPort());
-        System.out.println("---------------------------------\n");
         usersList = new ArrayList<>(); // la liste de mes clients
     }
 
+    /**
+     * 
+     */
     @Override
     public void run() {
+        System.out.println("Server launch on port : " + serverSocket.getLocalPort());
+        System.out.println("---------------------------------\n");
+        
         Socket client = null;
         try {
             while (true) {
@@ -67,14 +91,48 @@ public final class Server extends Thread {
         }
     } 
   
+    /**
+     * RSA creation keys
+     * @throws NoSuchAlgorithmException 
+     */
+    private static void AssyKeyGen() throws NoSuchAlgorithmException{
+        KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
+        keyGen.initialize(1024);
+        KeyPair keypair = keyGen.genKeyPair();
+           
+        privateKey = keypair.getPrivate();       
+        publicKey = keypair.getPublic();
+    }
     
+    /**
+     * 
+     */
+    private void unWrapping( PrivateKey pk, ) {
+            try {
+                KeyGenerator keygen = KeyGenerator.getInstance("AES");
+                Cipher cipherRsa = Cipher.getInstance("RSA");
+                Cipher cipherAes = Cipher.getInstance("AES");
+
+                SecureRandom random = new SecureRandom();
+                keygen.init(random);
+                sessionK = keygen.generateKey();           
+                System.out.println("secretKey: "+ sessionK);
+
+                cipherRsa.init(Cipher.UNWRAP_MODE, pk);
+                wrappedKey = cipherRsa.unwrap(sessionK);
+    //            cipherAes.init(Cipher.ENCRYPT_MODE, sessionK);
+
+            } catch (Exception  ex) {}
+
+        }
     
-    
-    
-    
+
     //========================================================================//
     //Thread Client
     //========================================================================//
+    /**
+     * 
+     */
     public class ThreadClient extends Thread {
 
         private final Socket socketClient;
@@ -83,7 +141,14 @@ public final class Server extends Thread {
         private final String iaClient;
         private String nickname;
         
+        private SecretKey sessionK;
+        private PublicKey clientPK;    
 
+        /**
+         * 
+         * @param s
+         * @throws IOException 
+         */
         public ThreadClient(Socket s) throws IOException {
             socketClient = s;
             iaClient = s.getInetAddress().getHostAddress();
@@ -91,6 +156,9 @@ public final class Server extends Thread {
             this.ois = new ObjectInputStream(this.socketClient.getInputStream());         
         }
 
+        /**
+         * 
+         */
         @Override
         public void run() {
             Message message;
@@ -98,6 +166,10 @@ public final class Server extends Thread {
             try {
                 while ((message = ((Message) ois.readObject())) != null) {
                     switch (message.getType()) {
+                        
+                        /**
+                         * demande d'enregistrement
+                         */
                         case 0:
 //                            if(registration(message.getPseudo(),message.getMessage())){
 //                                System.out.println("inscription: "+message.getPseudo()+ " " +message.getPseudo()+"\n");
@@ -110,9 +182,12 @@ public final class Server extends Thread {
                             closeClConnection();
                             break;
                             
+                            /**
+                             * demande de login d'un client
+                             */
                         case 1:
                             System.out.println("je recois une demande de login de \""+message.getPseudo()+"\"");
-                            if(connection(message.getPseudo(),message.getMessage())){
+                            if(IDVerif(message.getPseudo(),message.getMessage())){
                                 System.out.println("demande acceptée");
                                 this.nickname = message.getPseudo();
                                 synchronized (usersList) {
@@ -129,15 +204,37 @@ public final class Server extends Thread {
                             }
                             
                             break;
-                            
+                           
+                            /**
+                             * un client se deco
+                             */
                         case 2: 
                             broadcast(new Message(nickname, " leaving.","******",message.getType()));
                             return;                  
 
+                            /**
+                             * un message a broadcast
+                             */
                         case 3:
                             broadcast(new Message(nickname,message.getMessage(),"******", 3));
                             break;
-                                                     
+                            
+                            /**
+                             * réception d'une cle d'un client
+                             */
+                        case 7:
+                            System.out.println("je recois une cle!");
+                            if(message.getMessage()=="public") clientPK = message.getPk();// TODO
+                            else if(message.getMessage()=="session") sessionK = (PrivateKey)message.getK();//todo
+                            break;
+                            
+                            /**
+                             * 
+                             */
+                        case 8:
+                            this.clientPK = message.getK();
+                            break;
+                                                  
                         default:
                             System.err.println("Unknow command from: "+ socketClient.getInetAddress().getCanonicalHostName());
                             break;
@@ -150,6 +247,10 @@ public final class Server extends Thread {
             
         } // fin run
         
+        /**
+         * 
+         * @param message 
+         */
         private synchronized void broadcast(Message message) {
             System.out.println(message.getPseudo() + " : " + message.getMessage() + "\n");
             synchronized(usersList){      
@@ -159,10 +260,9 @@ public final class Server extends Thread {
             }
         }
         
-        
-        /*
-        pour chaque client, envoie des infos de celui ci au client
-        */
+        /**
+         * pour chaque client, envoie des infos de celui ci au client
+         */
         private void contactSending(){
             synchronized(usersList){      
                 for (int i = 0; i < usersList.size(); i++) {
@@ -173,7 +273,13 @@ public final class Server extends Thread {
             }
         }
         
-        private boolean connection(String name,String pwd){
+        /**
+         * 
+         * @param name
+         * @param pwd
+         * @return 
+         */
+        private boolean IDVerif(String name,String pwd){
             
             StringTokenizer chaine = null;
             String fichier ="fichiertexte.txt";
@@ -211,7 +317,12 @@ public final class Server extends Thread {
             return false;
         }
         
+        /**
+         * 
+         * @param message 
+         */
         private synchronized void sendToCl(Message message){
+            //TODO crypter avec cle de session
             try{
                 oos.writeObject(message);
                 oos.flush();
@@ -220,6 +331,9 @@ public final class Server extends Thread {
             }
         }
 
+        /**
+         * 
+         */
         private void closeClConnection() {
             try {
                 this.ois.close();
@@ -229,5 +343,6 @@ public final class Server extends Thread {
                 System.err.println("probleme à la fermetre du client");
             }                    
         }
+        
     }
 } 
