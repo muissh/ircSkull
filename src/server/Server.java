@@ -2,6 +2,7 @@ package server;
 
 import java.io.BufferedReader;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import message.Message;
 import java.io.IOException;
 import java.io.InputStream;
@@ -10,17 +11,29 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
+import java.security.InvalidKeyException;
+import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
+import java.security.NoSuchProviderException;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
 import java.util.StringTokenizer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
 import javax.crypto.KeyGenerator;
+import javax.crypto.NoSuchPaddingException;
 import javax.crypto.SecretKey;
+import message.MessageByte;
 
 /**
  * SERVER CLASS
@@ -40,7 +53,16 @@ public final class Server extends Thread {
     
     private static PrivateKey privateKey;
     private static PublicKey publicKey;
- 
+    
+     /**
+     * 
+     * @throws IOException 
+     */
+    Server() throws IOException { 
+        serverSocket = new ServerSocket(serverSocketPort);
+        usersList = new ArrayList<>(); // la liste de mes clients
+    }
+    
     /**
      * 
      * @param args 
@@ -53,15 +75,6 @@ public final class Server extends Thread {
         } catch (Exception ioe) {
             System.err.println("Error while launching server "+ ioe);
         }
-    }
-
-    /**
-     * 
-     * @throws IOException 
-     */
-    Server() throws IOException { 
-        serverSocket = new ServerSocket(serverSocketPort);
-        usersList = new ArrayList<>(); // la liste de mes clients
     }
 
     /**
@@ -90,43 +103,64 @@ public final class Server extends Thread {
             }
         }
     } 
-  
-    /**
-     * RSA creation keys
-     * @throws NoSuchAlgorithmException 
-     */
-    private static void AssyKeyGen() throws NoSuchAlgorithmException{
-        KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
-        keyGen.initialize(1024);
-        KeyPair keypair = keyGen.genKeyPair();
-           
-        privateKey = keypair.getPrivate();       
-        publicKey = keypair.getPublic();
+    {
+        try /**
+         * RSA creation keys
+         * @throws NoSuchAlgorithmException
+         */ {
+            KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
+            keyGen.initialize(1024);
+            KeyPair keypair = keyGen.genKeyPair();
+            
+            privateKey = keypair.getPrivate();
+            publicKey = keypair.getPublic();
+        } catch (NoSuchAlgorithmException ex) {
+            Logger.getLogger(Server.class.getName()).log(Level.SEVERE, null, ex);
+        }
     }
-    
+
     /**
      * 
-     */
-    private void unWrapping( PrivateKey pk, ) {
+     * @return
+     * @throws IOException
+     * @throws NoSuchAlgorithmException
+     * @throws NoSuchProviderException
+     * @throws InvalidKeySpecException 
+     */    
+    private PublicKey serverPKRecup(){
+        FileInputStream keyfis = null;
+        try {
+            keyfis = new FileInputStream("serverPK.puk");
+            byte[] encKey = new byte[keyfis.available()];
+            keyfis.read(encKey);
+            keyfis.close();
+            X509EncodedKeySpec pubKeySpec = new X509EncodedKeySpec(encKey);
+            KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+            return keyFactory.generatePublic(pubKeySpec);
+        } catch (FileNotFoundException ex) {
+            Logger.getLogger(Server.class.getName()).log(Level.SEVERE, null, ex);
+        } catch (IOException ex) {
+            Logger.getLogger(Server.class.getName()).log(Level.SEVERE, null, ex);
+        } catch (InvalidKeySpecException | NoSuchAlgorithmException ex) {
+            Logger.getLogger(Server.class.getName()).log(Level.SEVERE, null, ex);
+        } finally {
             try {
-                KeyGenerator keygen = KeyGenerator.getInstance("AES");
-                Cipher cipherRsa = Cipher.getInstance("RSA");
-                Cipher cipherAes = Cipher.getInstance("AES");
-
-                SecureRandom random = new SecureRandom();
-                keygen.init(random);
-                sessionK = keygen.generateKey();           
-                System.out.println("secretKey: "+ sessionK);
-
-                cipherRsa.init(Cipher.UNWRAP_MODE, pk);
-                wrappedKey = cipherRsa.unwrap(sessionK);
-    //            cipherAes.init(Cipher.ENCRYPT_MODE, sessionK);
-
-            } catch (Exception  ex) {}
-
+                keyfis.close();
+            } catch (IOException ex) {
+                Logger.getLogger(Server.class.getName()).log(Level.SEVERE, null, ex);
+            }
         }
-    
+        return null;
+    }
 
+    public void unwrap(final MessageByte msg) throws NoSuchAlgorithmException, NoSuchPaddingException, InvalidKeyException{
+        Cipher cipherRsa = Cipher.getInstance("RSA");
+        cipherRsa.init(Cipher.UNWRAP_MODE, privateKey);
+        sessKey = (SecretKey) cipherRsa.unwrap(msg.getMyObject(), "AES", Cipher.SECRET_KEY);
+        System.out.println(sessKey);
+    }
+    
+    
     //========================================================================//
     //Thread Client
     //========================================================================//
@@ -136,8 +170,8 @@ public final class Server extends Thread {
     public class ThreadClient extends Thread {
 
         private final Socket socketClient;
-        private final ObjectOutputStream oos;
-        private final ObjectInputStream ois;
+        private final ObjectOutputStream output;
+        private final ObjectInputStream input;
         private final String iaClient;
         private String nickname;
         
@@ -152,8 +186,8 @@ public final class Server extends Thread {
         public ThreadClient(Socket s) throws IOException {
             socketClient = s;
             iaClient = s.getInetAddress().getHostAddress();
-            this.oos = new ObjectOutputStream(this.socketClient.getOutputStream());
-            this.ois = new ObjectInputStream(this.socketClient.getInputStream());         
+            this.output = new ObjectOutputStream(this.socketClient.getOutputStream());
+            this.input = new ObjectInputStream(this.socketClient.getInputStream());         
         }
 
         /**
@@ -161,10 +195,23 @@ public final class Server extends Thread {
          */
         @Override
         public void run() {
+            Object o;
             Message message;
-
-            try {
-                while ((message = ((Message) ois.readObject())) != null) {
+            MessageByte messageByte;
+         
+            try {      
+            loop: while(( o = input.readObject()) != null) {
+                
+                    if(o.getClass().getName().equalsIgnoreCase("Message")){
+                        message = (Message)o;
+                        
+                    }else if(o.getClass().getName().equalsIgnoreCase("MessageByte")){   
+                        messageByte = (MessageByte) o;
+                        message = msgUncrypting(messageByte.getArrayByte(), sessionK);
+                        
+                    }else 
+                        message = null;
+                    
                     switch (message.getType()) {
                         
                         /**
@@ -179,7 +226,7 @@ public final class Server extends Thread {
 //                                broadcast(new Message("SEVER","KCA","******",4));
 //                            }
                             
-                            closeClConnection();
+                            closeConnection();
                             break;
                             
                             /**
@@ -194,13 +241,13 @@ public final class Server extends Thread {
                                     usersList.add(this);
                                     broadcast(new Message(message.getPseudo()," connecting.","******",3));  
                                 }
-                                sendToCl(new Message(message.getPseudo()," you're now online.","******",3));
+                                cryptedSend(new Message(message.getPseudo()," you're now online.","******",3));
                                 contactSending();
                                 
                             }else{
                                 System.out.println("demande refusée");
-                                sendToCl(new Message(message.getPseudo()," connexion refused.","******",3));
-                                closeClConnection();
+                                cryptedSend(new Message(message.getPseudo()," connexion refused.","******",3));
+                                closeConnection();
                             }
                             
                             break;
@@ -220,19 +267,18 @@ public final class Server extends Thread {
                             break;
                             
                             /**
-                             * réception d'une cle d'un client
+                             * réception de clé de session du contact
                              */
                         case 7:
-                            System.out.println("je recois une cle!");
-                            if(message.getMessage()=="public") clientPK = message.getPk();// TODO
-                            else if(message.getMessage()=="session") sessionK = (PrivateKey)message.getK();//todo
+                            System.out.println("TODO CONVERSION");
+                            //this.sessionK =  message.getK();
                             break;
                             
                             /**
-                             * 
+                             * reception de cle publique d'un client pour la donner a ses contact
                              */
                         case 8:
-                            this.clientPK = message.getK();
+                            //this.cliPubKey = message.getK();
                             break;
                                                   
                         default:
@@ -255,7 +301,7 @@ public final class Server extends Thread {
             System.out.println(message.getPseudo() + " : " + message.getMessage() + "\n");
             synchronized(usersList){      
                 for(ThreadClient tcl : usersList){
-                    tcl.sendToCl(message);        
+                    tcl.cryptedSend(message);        
                 }
             }
         }
@@ -267,7 +313,7 @@ public final class Server extends Thread {
             synchronized(usersList){      
                 for (int i = 0; i < usersList.size(); i++) {
                     if(usersList.get(i) != this){
-                        sendToCl(new Message(usersList.get(i).nickname,""+(clientPort),usersList.get(i).iaClient,5));
+                        cryptedSend(new Message(usersList.get(i).nickname,""+(clientPort),usersList.get(i).iaClient,5));
                     }
                 }
             }
@@ -316,33 +362,106 @@ public final class Server extends Thread {
             }
             return false;
         }
-        
-        /**
-         * 
-         * @param message 
-         */
-        private synchronized void sendToCl(Message message){
-            //TODO crypter avec cle de session
-            try{
-                oos.writeObject(message);
-                oos.flush();
-            }catch(IOException ioe){
-                System.err.println(ioe);
-            }
-        }
 
         /**
          * 
          */
-        private void closeClConnection() {
+        private void closeConnection() {
             try {
-                this.ois.close();
-                this.oos.close();
+                this.input.close();
+                this.output.close();
                 this.socketClient.close();
             } catch (IOException ex) {
                 System.err.println("probleme à la fermetre du client");
             }                    
         }
         
+        /**
+         * 
+         * @param m
+         * @param i 
+         */
+        protected void send(Message m) {
+            //TODO crypter avec cle de session
+            try {
+                output.writeObject(m);
+                output.flush();
+            } catch (SocketException  ioe) {
+                System.err.println("Connection lost. "+ ioe.getMessage() +"\n");
+            }catch(IOException ioe){
+                System.err.println("A wild problem appears! "+ ioe.getMessage() +"\n");
+            }
+        }
+        
+        /**
+         * 
+         * @param m 
+         */
+        protected void cryptedSend(Message m){
+            try {
+                output.writeObject(new MessageByte(msgCrypting( m, sessionK)));
+                output.flush();
+            } catch (SocketException  ioe) {
+                System.err.println("Connection lost. "+ ioe.getMessage() +"\n");
+            }catch(IOException ioe){
+                System.err.println("A wild problem appears! "+ ioe.getMessage() +"\n");
+            }
+        }    
+        
+        /**
+        * 
+        * @param msg
+        * @param cle
+        * @return
+        * @throws NoSuchAlgorithmException
+        * @throws NoSuchPaddingException
+        * @throws InvalidKeyException
+        * @throws IllegalBlockSizeException
+        * @throws BadPaddingException 
+        */
+        public byte[] msgCrypting(final Message msg, SecretKey cle){
+           try {
+               Cipher cipher = Cipher.getInstance("AES");
+               cipher.init(Cipher.ENCRYPT_MODE, cle);
+               byte[] donnees = null;
+               donnees = Message.serialize(msg);
+
+               return cipher.doFinal(donnees);
+           } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | IllegalBlockSizeException | BadPaddingException ex) {
+
+           }
+           return null;
+       }
+
+        /**
+        * 
+        * @param donnees
+        * @param cle
+        * @return
+        * @throws NoSuchAlgorithmException
+        * @throws NoSuchPaddingException
+        * @throws InvalidKeyException
+        * @throws IllegalBlockSizeException
+        * @throws BadPaddingException 
+        */
+        public  Message msgUncrypting(final byte[] donnees, SecretKey cle){
+               try {
+                   Message msg = null;
+                   Cipher cipher = Cipher.getInstance("AES");
+                   cipher.init(Cipher.DECRYPT_MODE, cle);
+                   
+                   try {
+                       msg = (Message) Message.deserialize(cipher.doFinal(donnees));
+                       //return new String(cipher.doFinal(donnees));
+                   } catch (IOException | ClassNotFoundException | IllegalBlockSizeException | BadPaddingException ex) {
+                       Logger.getLogger(Server.class.getName()).log(Level.SEVERE, null, ex);
+                   }
+                   return msg;
+               } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException ex) {
+                   Logger.getLogger(Server.class.getName()).log(Level.SEVERE, null, ex);
+               }
+            return null;
+           }
+
     }
 } 
